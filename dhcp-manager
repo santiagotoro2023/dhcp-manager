@@ -36,7 +36,7 @@
 set -euo pipefail
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-readonly VERSION="1.1.0"
+readonly VERSION="1.2.0"
 readonly DHCPD_CONF="/etc/dhcp/dhcpd.conf"
 readonly DHCPD_DEFAULT="/etc/default/isc-dhcp-server"
 readonly LEASES_FILE="/var/lib/dhcp/dhcpd.leases"
@@ -397,9 +397,7 @@ subnet ${network} netmask ${netmask} {"
 
 # ── Interface selection ───────────────────────────────────────────────────────
 _iface_select() {
-  # Build rich display table, then let user pick by number
   local -a ifaces=()
-
   while IFS= read -r iface; do
     ifaces+=("$iface")
   done < <(ip -o link show | awk -F': ' '{print $2}' | grep -v '^lo$')
@@ -407,9 +405,8 @@ _iface_select() {
   [[ ${#ifaces[@]} -eq 0 ]] && die "No network interfaces found."
 
   echo ""
-  printf "  ${BOLD}%-4s  %-14s %-19s %-18s %-8s %s${RESET}\n" \
-    "#" "INTERFACE" "MAC ADDRESS" "IPv4 ADDRESS" "STATE" "CURRENT"
-  echo -e "  ${DIM}────  ──────────────  ─────────────────  ──────────────────  ────────  ───────${RESET}"
+  echo -e "  ${BOLD}  #   Interface       MAC Address         IPv4 Address       State    Note${RESET}"
+  echo -e "  ${DIM}  ─   ─────────────   ─────────────────   ────────────────   ──────   ──────────${RESET}"
 
   local i=1
   for iface in "${ifaces[@]}"; do
@@ -419,20 +416,20 @@ _iface_select() {
     local state; state=$(ip link show "$iface" 2>/dev/null | awk '/state/{print $9}' | head -1)
     state="${state:-UNKNOWN}"
 
-    local state_col
+    local state_str
     case "$state" in
-      UP)   state_col="${GREEN}UP${RESET}" ;;
-      DOWN) state_col="${RED}DOWN${RESET}" ;;
-      *)    state_col="${YELLOW}${state}${RESET}" ;;
+      UP)   state_str="${GREEN}UP     ${RESET}" ;;
+      DOWN) state_str="${RED}DOWN   ${RESET}" ;;
+      *)    state_str="${YELLOW}${state:0:7}${RESET}" ;;
     esac
 
-    local current_marker=""
+    local note=""
     if [[ -f "$DHCPD_DEFAULT" ]] && grep -q "\"${iface}\"" "$DHCPD_DEFAULT" 2>/dev/null; then
-      current_marker="${CYAN}◀ active${RESET}"
+      note="${CYAN}◀ dhcpd${RESET}"
     fi
 
-    printf "  ${CYAN}%-4s${RESET}  ${BOLD}%-14s${RESET} ${DIM}%-19s${RESET} %-18s %-8b %b\n" \
-      "${i})" "$iface" "$mac" "$ip4" "$state_col" "$current_marker"
+    # Print fixed-width columns — no %b, use echo -e for colour
+    echo -e "  ${CYAN}  ${i})${RESET}  $(printf "%-15s" "$iface")  ${DIM}$(printf "%-18s" "$mac")${RESET}  $(printf "%-18s" "$ip4")  ${state_str}  ${note}"
     ((i++))
   done
   echo ""
@@ -442,7 +439,7 @@ _iface_select() {
     read -r _sel
     if [[ "$_sel" =~ ^[0-9]+$ ]] && (( _sel >= 1 && _sel <= ${#ifaces[@]} )); then
       _SELECTED_IFACE="${ifaces[$((_sel-1))]}"
-      ok "Selected interface: ${BOLD}${_SELECTED_IFACE}${RESET}"
+      ok "Selected: ${BOLD}${_SELECTED_IFACE}${RESET}  (${mac}  ${ip4})"
       return 0
     fi
     warn "Enter a number between 1 and ${#ifaces[@]}."
@@ -692,9 +689,8 @@ cmd_interface_list() {
     ifaces+=("$iface")
   done < <(ip -o link show | awk -F': ' '{print $2}' | grep -v '^lo$')
 
-  printf "  ${BOLD}%-14s %-19s %-18s %-10s %s${RESET}\n" \
-    "INTERFACE" "MAC ADDRESS" "IPv4 ADDRESS" "STATE" "DHCP LISTENER"
-  echo -e "  ${DIM}──────────────  ─────────────────  ──────────────────  ──────────  ─────────────${RESET}"
+  echo -e "  ${BOLD}  Interface       MAC Address         IPv4 Address       State    DHCP${RESET}"
+  echo -e "  ${DIM}  ─────────────   ─────────────────   ────────────────   ──────   ──────────${RESET}"
 
   for iface in "${ifaces[@]}"; do
     local mac; mac=$(cat "/sys/class/net/${iface}/address" 2>/dev/null || echo "??:??:??:??:??:??")
@@ -703,11 +699,11 @@ cmd_interface_list() {
     local state; state=$(ip link show "$iface" 2>/dev/null | awk '/state/{print $9}' | head -1)
     state="${state:-UNKNOWN}"
 
-    local state_col
+    local state_str
     case "$state" in
-      UP)   state_col="${GREEN}UP${RESET}" ;;
-      DOWN) state_col="${RED}DOWN${RESET}" ;;
-      *)    state_col="${YELLOW}${state}${RESET}" ;;
+      UP)   state_str="${GREEN}UP     ${RESET}" ;;
+      DOWN) state_str="${RED}DOWN   ${RESET}" ;;
+      *)    state_str="${YELLOW}${state:0:7}${RESET}" ;;
     esac
 
     local listener=""
@@ -715,8 +711,7 @@ cmd_interface_list() {
       listener="${CYAN}◀ dhcpd${RESET}"
     fi
 
-    printf "  ${BOLD}%-14s${RESET} ${DIM}%-19s${RESET} %-18s %-10b %b\n" \
-      "$iface" "$mac" "$ip4" "$state_col" "$listener"
+    echo -e "  ${BOLD}  $(printf "%-15s" "$iface")${RESET}  ${DIM}$(printf "%-18s" "$mac")${RESET}  $(printf "%-18s" "$ip4")  ${state_str}  ${listener}"
   done
   echo ""
 }
@@ -975,127 +970,139 @@ cmd_log_show() {
   fi
 }
 
+# ── Helper: remove a file if it exists and report ────────────────────────────
+_rm_file() {
+  if [[ -e "$1" ]]; then
+    rm -f "$1" && info "  Removed: $1"
+  fi
+}
+
 # ── UNINSTALL ─────────────────────────────────────────────────────────────────
 cmd_uninstall() {
   require_root
   header "Uninstall & Clean ISC DHCP Server"
 
+  local self_path; self_path=$(readlink -f "${BASH_SOURCE[0]}")
+
   echo -e "${YELLOW}This will perform a full system clean:${RESET}"
   echo -e "  ${DIM}•${RESET} Stop and disable isc-dhcp-server service"
   echo -e "  ${DIM}•${RESET} Purge isc-dhcp-server package (apt --purge)"
-  echo -e "  ${DIM}•${RESET} Remove /etc/dhcp/dhcpd.conf"
+  echo -e "  ${DIM}•${RESET} Remove /etc/dhcp/dhcpd.conf and related files"
   echo -e "  ${DIM}•${RESET} Remove /etc/default/isc-dhcp-server"
   echo -e "  ${DIM}•${RESET} Remove /var/lib/dhcp/dhcpd.leases*"
-  echo -e "  ${DIM}•${RESET} Remove any leftover /etc/dhcp/ package files"
   echo -e "  ${DIM}•${RESET} Run apt autoremove"
+  echo -e "  ${DIM}•${RESET} Optionally remove this utility (${self_path})"
   echo ""
 
   local keep_backups=true
   if [[ -d "$BACKUP_DIR" ]] && [[ -n "$(ls -A "$BACKUP_DIR" 2>/dev/null)" ]]; then
-    echo -e "  ${CYAN}Backups found in:${RESET} ${BACKUP_DIR}/"
+    echo -e "  ${CYAN}Config backups found in:${RESET} ${BACKUP_DIR}/"
     ls -1t "$BACKUP_DIR" | while read -r b; do echo -e "    ${DIM}${b}${RESET}"; done
     echo ""
-    prompt_yn "  Delete config backups too? (say N to keep them)" N       && keep_backups=false || keep_backups=true
+    if prompt_yn "  Delete config backups too? (N = keep them)" N; then
+      keep_backups=false
+    fi
+  fi
+
+  local remove_self=false
+  if prompt_yn "  Remove dhcp-manager utility itself (${self_path})?" N; then
+    remove_self=true
   fi
 
   echo ""
   prompt_yn "Proceed with full uninstall?" N || { info "Aborted. Nothing was changed."; return 0; }
 
-  # ── 1. Backup before we nuke (only if keeping) ──────────────────────────────
+  # ── 1. Final backup ──────────────────────────────────────────────────────────
   if $keep_backups; then
     backup_conf
-    ok "Final config backup saved to ${BACKUP_DIR}/"
+    ok "Final config snapshot saved to ${BACKUP_DIR}/"
   fi
 
-  # ── 2. Stop & disable service ────────────────────────────────────────────────
+  # ── 2. Stop & disable ────────────────────────────────────────────────────────
   info "Stopping and disabling isc-dhcp-server..."
-  systemctl stop    isc-dhcp-server 2>/dev/null && ok "Service stopped."   || warn "Service was not running."
-  systemctl disable isc-dhcp-server 2>/dev/null && ok "Service disabled."  || warn "Service was not enabled."
+  systemctl stop    isc-dhcp-server 2>/dev/null || true
+  systemctl disable isc-dhcp-server 2>/dev/null || true
+  ok "Service stopped and disabled."
 
-  # ── 3. Purge package ────────────────────────────────────────────────────────
-  info "Purging isc-dhcp-server package..."
-  if dpkg -l isc-dhcp-server &>/dev/null; then
-    DEBIAN_FRONTEND=noninteractive apt-get remove --purge -y isc-dhcp-server 2>&1 | grep -v "^$" || true
-    ok "Package purged."
+  # ── 3. Purge package ─────────────────────────────────────────────────────────
+  info "Purging package..."
+  if dpkg-query -W -f='${Status}' isc-dhcp-server 2>/dev/null | grep -q "install ok"; then
+    DEBIAN_FRONTEND=noninteractive apt-get remove --purge -y isc-dhcp-server || true
+    ok "Package purged via apt."
   else
-    info "Package was not installed via apt — skipping."
+    info "Package not found in dpkg — skipping apt remove."
   fi
 
-  # ── 4. Remove config files left behind ─────────────────────────────────────
-  info "Removing residual configuration files..."
+  # ── 4. Remove config & runtime files ─────────────────────────────────────────
+  info "Removing configuration and runtime files..."
+  _rm_file "$DHCPD_CONF"
+  _rm_file "${DHCPD_CONF}.bak"
+  _rm_file "$DHCPD_DEFAULT"
+  _rm_file "${DHCPD_DEFAULT}.bak"
+  _rm_file "$LEASES_FILE"
+  _rm_file "${LEASES_FILE}~"
 
-  local removed=0
-
-  _rm_if_exists() {
-    local f="$1"
-    if [[ -e "$f" ]]; then
-      rm -f "$f" && info "  Removed: ${f}" && ((removed++))
-    fi
-  }
-
-  _rm_if_exists "$DHCPD_CONF"
-  _rm_if_exists "${DHCPD_CONF}.bak"
-  _rm_if_exists "$DHCPD_DEFAULT"
-  _rm_if_exists "${DHCPD_DEFAULT}.bak"
-  _rm_if_exists "$LEASES_FILE"
-  _rm_if_exists "${LEASES_FILE}~"
-
-  # Extra lease files
   for f in /var/lib/dhcp/dhcpd.leases.*; do
-    [[ -e "$f" ]] && rm -f "$f" && info "  Removed: ${f}" && ((removed++)) || true
+    [[ -e "$f" ]] && rm -f "$f" && info "  Removed: $f" || true
   done
 
-  # Remove /etc/dhcp/ only if empty after backup decision
   if $keep_backups; then
-    # Remove everything except backups dir
-    find /etc/dhcp/ -maxdepth 1 -not -name "backups" -not -path "/etc/dhcp/"       -exec rm -rf {} + 2>/dev/null && info "  Cleaned /etc/dhcp/ (backups preserved)" || true
+    find /etc/dhcp/ -maxdepth 1 ! -name "backups" ! -path "/etc/dhcp/"       -exec rm -rf {} + 2>/dev/null || true
+    info "  Cleaned /etc/dhcp/ (backups preserved)"
   else
-    rm -rf /etc/dhcp/ && info "  Removed: /etc/dhcp/ (including backups)" && ((removed++)) || true
+    rm -rf /etc/dhcp/ 2>/dev/null || true
+    info "  Removed: /etc/dhcp/ (including backups)"
   fi
 
-  # Systemd unit drop-ins if any
   if [[ -d /etc/systemd/system/isc-dhcp-server.service.d ]]; then
     rm -rf /etc/systemd/system/isc-dhcp-server.service.d
-    info "  Removed: systemd drop-in directory"
     systemctl daemon-reload
+    info "  Removed: systemd drop-in directory"
   fi
 
-  # ── 5. Autoremove orphaned dependencies ────────────────────────────────────
+  # ── 5. Autoremove ────────────────────────────────────────────────────────────
   info "Running apt autoremove..."
-  DEBIAN_FRONTEND=noninteractive apt-get autoremove -y 2>&1 | grep -v "^$" || true
+  DEBIAN_FRONTEND=noninteractive apt-get autoremove -y 2>/dev/null || true
 
-  # ── 6. Final verification ───────────────────────────────────────────────────
+  # ── 6. Remove utility itself ─────────────────────────────────────────────────
+  if $remove_self; then
+    info "Removing dhcp-manager utility..."
+    for loc in "$self_path" /usr/local/bin/dhcp-manager /usr/bin/dhcp-manager; do
+      [[ -f "$loc" ]] && rm -f "$loc" && ok "  Removed: ${loc}" || true
+    done
+  fi
+
+  # ── 7. Verification summary ───────────────────────────────────────────────────
   echo ""
   divider
-  echo -e "${BOLD}Clean-up summary:${RESET}"
+  echo -e "${BOLD}Verification:${RESET}"
 
   if command -v dhcpd &>/dev/null; then
-    warn "dhcpd binary still found at: $(command -v dhcpd)"
-    warn "You may need to remove it manually or check for manual installations."
+    warn "dhcpd binary still present: $(command -v dhcpd)"
   else
-    ok "dhcpd binary: not present"
+    ok "dhcpd binary:   not present"
   fi
 
-  if dpkg -l isc-dhcp-server &>/dev/null 2>&1 | grep -q "^ii"; then
-    warn "Package still appears installed — check: dpkg -l isc-dhcp-server"
+  if dpkg-query -W -f='${Status}' isc-dhcp-server 2>/dev/null | grep -q "install ok"; then
+    warn "Package still installed — run: sudo apt purge isc-dhcp-server"
   else
-    ok "Package: fully removed"
+    ok "Package:        fully removed"
   fi
 
-  [[ -f "$DHCPD_CONF" ]]    && warn "Config still present: ${DHCPD_CONF}" || ok "Config files: removed"
-  [[ -f "$LEASES_FILE" ]]   && warn "Leases file still present: ${LEASES_FILE}" || ok "Lease files: removed"
+  [[ -f "$DHCPD_CONF" ]]  && warn "Config still present: ${DHCPD_CONF}"  || ok "Config files:   removed"
+  [[ -f "$LEASES_FILE" ]] && warn "Leases still present: ${LEASES_FILE}" || ok "Lease files:    removed"
+
+  if $remove_self; then
+    [[ -f "$self_path" ]] && warn "Utility still present: ${self_path}" || ok "dhcp-manager:   removed"
+  fi
 
   if $keep_backups && [[ -d "$BACKUP_DIR" ]]; then
-    info "Backups preserved at: ${BACKUP_DIR}/"
-    info "To remove them manually: sudo rm -rf ${BACKUP_DIR}"
+    info "Backups preserved: ${BACKUP_DIR}/"
+    info "Remove manually:   sudo rm -rf ${BACKUP_DIR}"
   fi
 
   echo ""
-  ok "isc-dhcp-server has been fully removed. System is clean."
-
-  # Suggest reinstall path
-  echo -e "
-${DIM}To reinstall: sudo dhcp-manager install${RESET}"
+  ok "System clean. To reinstall: copy dhcp-manager back, then sudo dhcp-manager install"
 }
 
 # ── Reload helper ─────────────────────────────────────────────────────────────
