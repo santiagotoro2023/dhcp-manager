@@ -398,48 +398,61 @@ subnet ${network} netmask ${netmask} {"
 # ── Interface selection ───────────────────────────────────────────────────────
 _iface_select() {
   local -a ifaces=()
+  local -a macs=()
+  local -a ip4s=()
+  local -a states=()
+
   while IFS= read -r iface; do
     ifaces+=("$iface")
+    macs+=("$(cat "/sys/class/net/${iface}/address" 2>/dev/null || echo "??:??:??:??:??:??")")
+    local _ip4; _ip4=$(ip -4 addr show "$iface" 2>/dev/null | awk '/inet /{print $2}' | head -1)
+    ip4s+=("${_ip4:----}")
+    local _st; _st=$(ip -o link show "$iface" 2>/dev/null | awk '{print $9}' | head -1)
+    states+=("${_st:-UNKNOWN}")
   done < <(ip -o link show | awk -F': ' '{print $2}' | grep -v '^lo$')
 
   [[ ${#ifaces[@]} -eq 0 ]] && die "No network interfaces found."
 
   echo ""
-  echo -e "  ${BOLD}  #   Interface       MAC Address         IPv4 Address       State    Note${RESET}"
-  echo -e "  ${DIM}  ─   ─────────────   ─────────────────   ────────────────   ──────   ──────────${RESET}"
+  echo -e "  ${BOLD}#    Interface        MAC Address          IPv4 Address        State    Active${RESET}"
+  echo -e "  ${DIM}───  ───────────────  ───────────────────  ──────────────────  ───────  ───────${RESET}"
 
-  local i=1
-  for iface in "${ifaces[@]}"; do
-    local mac; mac=$(cat "/sys/class/net/${iface}/address" 2>/dev/null || echo "??:??:??:??:??:??")
-    local ip4; ip4=$(ip -4 addr show "$iface" 2>/dev/null | awk '/inet /{print $2}' | head -1)
-    ip4="${ip4:----}"
-    local state; state=$(ip link show "$iface" 2>/dev/null | awk '/state/{print $9}' | head -1)
-    state="${state:-UNKNOWN}"
+  local i
+  for (( i=0; i<${#ifaces[@]}; i++ )); do
+    local _iface="${ifaces[$i]}"
+    local _mac="${macs[$i]}"
+    local _ip="${ip4s[$i]}"
+    local _state="${states[$i]}"
 
-    local state_str
-    case "$state" in
-      UP)   state_str="${GREEN}UP     ${RESET}" ;;
-      DOWN) state_str="${RED}DOWN   ${RESET}" ;;
-      *)    state_str="${YELLOW}${state:0:7}${RESET}" ;;
+    local _state_col
+    case "$_state" in
+      UP)   _state_col="${GREEN}UP${RESET}     " ;;
+      DOWN) _state_col="${RED}DOWN${RESET}   " ;;
+      *)    _state_col="${YELLOW}${_state:0:7}${RESET}" ;;
     esac
 
-    local note=""
-    if [[ -f "$DHCPD_DEFAULT" ]] && grep -q "\"${iface}\"" "$DHCPD_DEFAULT" 2>/dev/null; then
-      note="${CYAN}◀ dhcpd${RESET}"
+    local _active=""
+    if [[ -f "$DHCPD_DEFAULT" ]] && grep -q ""${_iface}"" "$DHCPD_DEFAULT" 2>/dev/null; then
+      _active="${CYAN}◀ dhcpd${RESET}"
     fi
 
-    # Print fixed-width columns — no %b, use echo -e for colour
-    echo -e "  ${CYAN}  ${i})${RESET}  $(printf "%-15s" "$iface")  ${DIM}$(printf "%-18s" "$mac")${RESET}  $(printf "%-18s" "$ip4")  ${state_str}  ${note}"
-    ((i++))
+    local _num; _num=$(printf "%d" "$((i+1))")
+    local _iface_pad; _iface_pad=$(printf "%-15s" "$_iface")
+    local _mac_pad;   _mac_pad=$(printf "%-19s" "$_mac")
+    local _ip_pad;    _ip_pad=$(printf "%-18s" "$_ip")
+
+    echo -e "  ${CYAN}${_num})${RESET}   ${BOLD}${_iface_pad}${RESET}  ${DIM}${_mac_pad}${RESET}  ${_ip_pad}  ${_state_col}  ${_active}"
   done
   echo ""
 
+  local _sel
   while true; do
     echo -ne "${BOLD}Select interface [1-${#ifaces[@]}]${RESET}: "
     read -r _sel
     if [[ "$_sel" =~ ^[0-9]+$ ]] && (( _sel >= 1 && _sel <= ${#ifaces[@]} )); then
-      _SELECTED_IFACE="${ifaces[$((_sel-1))]}"
-      ok "Selected: ${BOLD}${_SELECTED_IFACE}${RESET}  (${mac}  ${ip4})"
+      local _idx=$(( _sel - 1 ))
+      _SELECTED_IFACE="${ifaces[$_idx]}"
+      ok "Selected: ${BOLD}${_SELECTED_IFACE}${RESET}   MAC: ${macs[$_idx]}   IP: ${ip4s[$_idx]}"
       return 0
     fi
     warn "Enter a number between 1 and ${#ifaces[@]}."
