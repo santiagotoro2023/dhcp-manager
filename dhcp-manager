@@ -1,0 +1,1199 @@
+#!/usr/bin/env bash
+# =============================================================================
+# dhcp-manager — ISC DHCP Server Installation & Configuration Utility
+# =============================================================================
+# Usage:
+#   dhcp-manager                         Interactive wizard
+#   dhcp-manager install                 Install isc-dhcp-server
+#   dhcp-manager configure               Re-run configuration wizard
+#   dhcp-manager subnet add              Add a subnet interactively
+#   dhcp-manager subnet list             List configured subnets
+#   dhcp-manager subnet remove <net>     Remove a subnet
+#   dhcp-manager lease list              Show active leases
+#   dhcp-manager lease static add        Add a static lease
+#   dhcp-manager lease static list       List static leases
+#   dhcp-manager lease static remove <mac>
+#   dhcp-manager option set              Set global DHCP options
+#   dhcp-manager option list             Show global options
+#   dhcp-manager service <start|stop|restart|status|enable|disable>
+#   dhcp-manager config show             Print current dhcpd.conf
+#   dhcp-manager config edit             Open dhcpd.conf in $EDITOR
+#   dhcp-manager config validate         Validate dhcpd.conf syntax
+#   dhcp-manager config backup           Backup dhcpd.conf
+#   dhcp-manager config restore          Restore from backup
+#   dhcp-manager interface set <iface>   Set listening interface
+#   dhcp-manager interface list          List available interfaces
+#   dhcp-manager pxe configure           Configure PXE boot options
+#   dhcp-manager failover configure      Configure failover peer
+#   dhcp-manager pool add                Add address pool to subnet
+#   dhcp-manager pool list               List all pools
+#   dhcp-manager log show                Show DHCP server logs
+#   dhcp-manager uninstall               Remove isc-dhcp-server
+#   dhcp-manager --help                  Show this help
+#   dhcp-manager --version               Show version
+# =============================================================================
+
+set -euo pipefail
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+readonly VERSION="1.0.0"
+readonly DHCPD_CONF="/etc/dhcp/dhcpd.conf"
+readonly DHCPD_DEFAULT="/etc/default/isc-dhcp-server"
+readonly LEASES_FILE="/var/lib/dhcp/dhcpd.leases"
+readonly BACKUP_DIR="/etc/dhcp/backups"
+readonly LOG_TAG="dhcp-manager"
+
+# ── Colours ───────────────────────────────────────────────────────────────────
+if [[ -t 1 ]]; then
+  RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'
+  CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; RESET='\033[0m'
+else
+  RED=''; YELLOW=''; GREEN=''; CYAN=''; BOLD=''; DIM=''; RESET=''
+fi
+
+# ── Logging helpers ───────────────────────────────────────────────────────────
+info()    { echo -e "${CYAN}[INFO]${RESET}  $*"; }
+ok()      { echo -e "${GREEN}[OK]${RESET}    $*"; }
+warn()    { echo -e "${YELLOW}[WARN]${RESET}  $*" >&2; }
+err()     { echo -e "${RED}[ERROR]${RESET} $*" >&2; }
+die()     { err "$*"; exit 1; }
+header()  { echo -e "\n${BOLD}${CYAN}══ $* ══${RESET}\n"; }
+section() { echo -e "\n${BOLD}$*${RESET}"; }
+divider() { echo -e "${DIM}────────────────────────────────────────────────────${RESET}"; }
+
+# ── Privilege check ───────────────────────────────────────────────────────────
+require_root() {
+  [[ $EUID -eq 0 ]] || die "This command must be run as root (try: sudo dhcp-manager $*)"
+}
+
+# ── Dependency check ──────────────────────────────────────────────────────────
+require_dhcpd() {
+  command -v dhcpd &>/dev/null || die "isc-dhcp-server is not installed. Run: dhcp-manager install"
+}
+
+# ── Prompt helpers ────────────────────────────────────────────────────────────
+prompt() {
+  # prompt <varname> <question> [default]
+  local varname="$1" question="$2" default="${3:-}"
+  local display_default=""
+  [[ -n "$default" ]] && display_default=" [${DIM}${default}${RESET}]"
+  while true; do
+    echo -ne "${BOLD}${question}${RESET}${display_default}: "
+    read -r "$varname"
+    local val="${!varname}"
+    if [[ -z "$val" && -n "$default" ]]; then
+      printf -v "$varname" '%s' "$default"
+      return 0
+    elif [[ -n "$val" ]]; then
+      return 0
+    fi
+    warn "Value required."
+  done
+}
+
+prompt_yn() {
+  # prompt_yn <question> [Y|N]  →  returns 0 for yes, 1 for no
+  local question="$1" default="${2:-Y}"
+  local opts="Y/n"; [[ "${default^^}" == "N" ]] && opts="y/N"
+  while true; do
+    echo -ne "${BOLD}${question}${RESET} [${opts}]: "
+    read -r _yn
+    _yn="${_yn:-$default}"
+    case "${_yn^^}" in
+      Y|YES) return 0 ;;
+      N|NO)  return 1 ;;
+      *) warn "Please answer y or n." ;;
+    esac
+  done
+}
+
+prompt_select() {
+  # prompt_select <varname> <question> <opt1> [opt2 ...]
+  local varname="$1" question="$2"; shift 2
+  local opts=("$@")
+  section "$question"
+  local i=1
+  for opt in "${opts[@]}"; do
+    echo -e "  ${CYAN}${i})${RESET} ${opt}"
+    ((i++))
+  done
+  while true; do
+    echo -ne "${BOLD}Choice${RESET} [1-${#opts[@]}]: "
+    read -r _sel
+    if [[ "$_sel" =~ ^[0-9]+$ ]] && (( _sel >= 1 && _sel <= ${#opts[@]} )); then
+      printf -v "$varname" '%s' "${opts[$((_sel-1))]}"
+      return 0
+    fi
+    warn "Enter a number between 1 and ${#opts[@]}."
+  done
+}
+
+# ── Validation helpers ────────────────────────────────────────────────────────
+is_valid_ip() {
+  local ip="$1"
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  local IFS='.'; read -ra parts <<< "$ip"
+  for p in "${parts[@]}"; do (( p <= 255 )) || return 1; done
+}
+
+is_valid_cidr() {
+  local cidr="$1"
+  [[ "$cidr" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$ ]] || return 1
+  local ip="${cidr%/*}"
+  is_valid_ip "$ip"
+}
+
+is_valid_mac() {
+  [[ "$1" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]
+}
+
+cidr_to_netmask() {
+  local prefix="$1"
+  local mask=0; local full_octets=$(( prefix / 8 )); local rem=$(( prefix % 8 ))
+  local octets=()
+  for (( i=0; i<4; i++ )); do
+    if (( i < full_octets )); then octets+=(255)
+    elif (( i == full_octets )); then octets+=( $(( 256 - (1 << (8 - rem)) )) )
+    else octets+=(0)
+    fi
+  done
+  echo "${octets[0]}.${octets[1]}.${octets[2]}.${octets[3]}"
+}
+
+network_address() {
+  # network_address <ip> <netmask>
+  local IFS='.'; read -ra ip <<< "$1"; read -ra nm <<< "$2"
+  echo "$(( ip[0] & nm[0] )).$(( ip[1] & nm[1] )).$(( ip[2] & nm[2] )).$(( ip[3] & nm[3] ))"
+}
+
+broadcast_address() {
+  local IFS='.'; read -ra ip <<< "$1"; read -ra nm <<< "$2"
+  echo "$(( ip[0] | (255 ^ nm[0]) )).$(( ip[1] | (255 ^ nm[1]) )).$(( ip[2] | (255 ^ nm[2]) )).$(( ip[3] | (255 ^ nm[3]) ))"
+}
+
+# ── Backup ────────────────────────────────────────────────────────────────────
+backup_conf() {
+  mkdir -p "$BACKUP_DIR"
+  local ts; ts=$(date +%Y%m%d_%H%M%S)
+  local dest="${BACKUP_DIR}/dhcpd.conf.${ts}"
+  [[ -f "$DHCPD_CONF" ]] && cp "$DHCPD_CONF" "$dest" && info "Backup saved: ${dest}"
+}
+
+# ── Config file writers ───────────────────────────────────────────────────────
+write_conf_header() {
+  cat > "$DHCPD_CONF" <<EOF
+# =============================================================================
+# dhcpd.conf — Managed by dhcp-manager v${VERSION}
+# Generated: $(date)
+# =============================================================================
+
+EOF
+}
+
+# ── INSTALL ───────────────────────────────────────────────────────────────────
+cmd_install() {
+  require_root
+  header "Installing ISC DHCP Server"
+
+  if command -v dhcpd &>/dev/null; then
+    ok "isc-dhcp-server is already installed."
+    if prompt_yn "Run configuration wizard now?"; then
+      cmd_configure
+    fi
+    return 0
+  fi
+
+  info "Updating package lists..."
+  apt-get update -qq || die "apt-get update failed"
+  info "Installing isc-dhcp-server..."
+  apt-get install -y isc-dhcp-server || die "Installation failed"
+  ok "isc-dhcp-server installed successfully."
+
+  # Stop the service so it doesn't fail on empty config
+  systemctl stop isc-dhcp-server 2>/dev/null || true
+  systemctl disable isc-dhcp-server 2>/dev/null || true
+
+  if prompt_yn "Run initial configuration wizard now?" Y; then
+    cmd_configure
+  else
+    info "Run 'dhcp-manager configure' when ready to configure."
+  fi
+}
+
+# ── CONFIGURE WIZARD ──────────────────────────────────────────────────────────
+cmd_configure() {
+  require_root
+  require_dhcpd
+  header "DHCP Server Configuration Wizard"
+
+  backup_conf
+
+  # ── 1. Interface ──────────────────────────────────────────────────────────
+  section "Step 1: Listening Interface"
+  _iface_select
+  local iface="$_SELECTED_IFACE"
+
+  # ── 2. Global options ─────────────────────────────────────────────────────
+  section "Step 2: Global Options"
+  prompt _domain_name   "Domain name"                    "local"
+  prompt _dns_servers   "DNS server(s) (comma-separated)" "8.8.8.8, 8.8.4.4"
+  prompt _default_lease "Default lease time (seconds)"   "86400"
+  prompt _max_lease     "Maximum lease time (seconds)"   "172800"
+
+  local authoritative="authoritative"
+  prompt_yn "Is this server authoritative for its subnets?" Y || authoritative="not authoritative"
+
+  local log_facility="local7"
+  if prompt_yn "Customise log-facility?" N; then
+    prompt log_facility "Log facility (e.g. local7, daemon)" "local7"
+  fi
+
+  # ── 3. Subnet ──────────────────────────────────────────────────────────────
+  section "Step 3: First Subnet"
+  local -a subnets=()
+  _collect_subnet _subnet_block
+  subnets+=("$_subnet_block")
+
+  while prompt_yn "Add another subnet?" N; do
+    _collect_subnet _subnet_block
+    subnets+=("$_subnet_block")
+  done
+
+  # ── 4. Write config ────────────────────────────────────────────────────────
+  write_conf_header
+
+  cat >> "$DHCPD_CONF" <<EOF
+# ── Global settings ───────────────────────────────────────────────────────────
+${authoritative};
+log-facility ${log_facility};
+
+option domain-name "${_domain_name}";
+option domain-name-servers ${_dns_servers};
+
+default-lease-time ${_default_lease};
+max-lease-time ${_max_lease};
+
+EOF
+
+  for block in "${subnets[@]}"; do
+    echo "$block" >> "$DHCPD_CONF"
+    echo "" >> "$DHCPD_CONF"
+  done
+
+  # ── 5. Interface file ──────────────────────────────────────────────────────
+  _write_interface_file "$iface"
+
+  # ── 6. Validate & start ────────────────────────────────────────────────────
+  if cmd_config_validate_quiet; then
+    ok "Configuration is valid."
+    if prompt_yn "Enable and start DHCP server now?" Y; then
+      systemctl enable isc-dhcp-server
+      systemctl restart isc-dhcp-server
+      ok "DHCP server started."
+      systemctl status isc-dhcp-server --no-pager -l | head -20
+    fi
+  else
+    err "Configuration has errors. Please review:"
+    cmd_config_validate
+  fi
+}
+
+# ── Collect one subnet interactively ──────────────────────────────────────────
+_collect_subnet() {
+  local __varname="$1"
+
+  local cidr router range_start range_end
+  local dns_override="" broadcast_override="" ntp="" wins="" tftp="" boot_file=""
+  local domain_override="" lease_default="" lease_max=""
+  local denied_unknown="allow"
+
+  # Network
+  while true; do
+    prompt cidr "  Subnet in CIDR notation (e.g. 192.168.20.0/24)"
+    is_valid_cidr "$cidr" && break
+    warn "Invalid CIDR. Example: 192.168.20.0/24"
+  done
+
+  local prefix="${cidr#*/}"
+  local netmask; netmask=$(cidr_to_netmask "$prefix")
+  local network; network=$(network_address "${cidr%/*}" "$netmask")
+  local broadcast; broadcast=$(broadcast_address "${cidr%/*}" "$netmask")
+
+  # Range
+  echo -e "  ${DIM}Network: ${network}  Netmask: ${netmask}  Broadcast: ${broadcast}${RESET}"
+  if prompt_yn "  Add an address pool (range) for dynamic allocation?" Y; then
+    while true; do
+      prompt range_start "    Pool start IP"
+      is_valid_ip "$range_start" && break; warn "Invalid IP."
+    done
+    while true; do
+      prompt range_end "    Pool end IP"
+      is_valid_ip "$range_end" && break; warn "Invalid IP."
+    done
+  fi
+
+  # Router (gateway)
+  while true; do
+    prompt router "  Default gateway (router)" ""
+    [[ -z "$router" ]] && break
+    is_valid_ip "$router" && break; warn "Invalid IP."
+  done
+
+  # Optional overrides
+  if prompt_yn "  Override DNS servers for this subnet?" N; then
+    prompt dns_override "    DNS server(s)" ""
+  fi
+  if prompt_yn "  Override domain name for this subnet?" N; then
+    prompt domain_override "    Domain name" ""
+  fi
+  if prompt_yn "  Set NTP server(s) for this subnet?" N; then
+    prompt ntp "    NTP server(s) (comma-separated)" ""
+  fi
+  if prompt_yn "  Set WINS server(s) for this subnet?" N; then
+    prompt wins "    WINS server(s)" ""
+  fi
+  if prompt_yn "  Set per-subnet lease times?" N; then
+    prompt lease_default "    Default lease time (seconds)" "$_default_lease"
+    prompt lease_max     "    Max lease time (seconds)"     "$_max_lease"
+  fi
+  if prompt_yn "  Configure PXE boot for this subnet?" N; then
+    prompt tftp      "    TFTP server IP"  ""
+    prompt boot_file "    Boot filename"   "pxelinux.0"
+  fi
+  if prompt_yn "  Deny unknown clients on this subnet?" N; then
+    denied_unknown="deny"
+  fi
+
+  # Build the block
+  local block="# ── Subnet ${network}/${prefix} ─────────────────────────────────────────────
+subnet ${network} netmask ${netmask} {"
+  [[ -n "${range_start:-}" ]] && block+="
+  pool {
+    ${denied_unknown} unknown clients;
+    range ${range_start} ${range_end};"
+  [[ -n "${lease_default:-}" ]] && block+="
+    default-lease-time ${lease_default};
+    max-lease-time ${lease_max};"
+  [[ -n "${range_start:-}" ]] && block+="
+  }"
+  [[ -n "$router" ]]           && block+="
+  option routers ${router};"
+  [[ -n "$dns_override" ]]     && block+="
+  option domain-name-servers ${dns_override};"
+  [[ -n "$domain_override" ]]  && block+="
+  option domain-name \"${domain_override}\";"
+  [[ -n "$ntp" ]]              && block+="
+  option ntp-servers ${ntp};"
+  [[ -n "$wins" ]]             && block+="
+  option netbios-name-servers ${wins};
+  option netbios-node-type 8;"
+  [[ -n "$tftp" ]]             && block+="
+  next-server ${tftp};
+  filename \"${boot_file}\";"
+  block+="
+}"
+  printf -v "$__varname" '%s' "$block"
+}
+
+# ── Interface selection ───────────────────────────────────────────────────────
+_iface_select() {
+  local ifaces=()
+  while IFS= read -r line; do
+    ifaces+=("$line")
+  done < <(ip -o link show | awk -F': ' '{print $2}' | grep -v '^lo$')
+
+  prompt_select _SELECTED_IFACE "Select interface for DHCP server to listen on:" "${ifaces[@]}"
+  ok "Selected interface: ${_SELECTED_IFACE}"
+}
+
+_write_interface_file() {
+  local iface="$1"
+  # Backup current default
+  [[ -f "$DHCPD_DEFAULT" ]] && cp "$DHCPD_DEFAULT" "${DHCPD_DEFAULT}.bak"
+
+  if grep -q 'INTERFACESv4' "$DHCPD_DEFAULT" 2>/dev/null; then
+    sed -i "s/^INTERFACESv4=.*/INTERFACESv4=\"${iface}\"/" "$DHCPD_DEFAULT"
+  else
+    echo "INTERFACESv4=\"${iface}\"" >> "$DHCPD_DEFAULT"
+  fi
+  ok "Interface set to: ${iface}"
+}
+
+# ── SUBNET commands ───────────────────────────────────────────────────────────
+cmd_subnet_add() {
+  require_root
+  require_dhcpd
+  header "Add Subnet"
+  backup_conf
+  _collect_subnet _new_block
+  echo "" >> "$DHCPD_CONF"
+  echo "$_new_block" >> "$DHCPD_CONF"
+  ok "Subnet added."
+  cmd_config_validate_quiet && ok "Config valid." && _reload_prompt || err "Config has errors, please fix manually."
+}
+
+cmd_subnet_list() {
+  require_dhcpd
+  header "Configured Subnets"
+  grep -E '^subnet ' "$DHCPD_CONF" | awk '{print "  • " $2 "/" NR " netmask " $4}' \
+    || info "No subnets configured."
+  # Show with netmask properly
+  grep -P '^subnet\s' "$DHCPD_CONF" | while read -r _ net _ mask _; do
+    echo -e "  ${GREEN}▸${RESET} ${net}  netmask ${mask}"
+  done
+}
+
+cmd_subnet_remove() {
+  require_root
+  require_dhcpd
+  local target="${1:-}"
+  if [[ -z "$target" ]]; then
+    prompt target "Network address to remove (e.g. 192.168.20.0)"
+  fi
+  backup_conf
+  # Remove block from subnet <target> netmask ... { ... }
+  python3 - "$DHCPD_CONF" "$target" <<'PYEOF'
+import sys, re
+conf_path, target = sys.argv[1], sys.argv[2]
+with open(conf_path) as f:
+    content = f.read()
+
+pattern = r'#[^\n]*\n' + r'subnet\s+' + re.escape(target) + r'\s+netmask[^{]+\{[^}]*(?:\{[^}]*\}[^}]*)?\}'
+new_content = re.sub(pattern, '', content, flags=re.DOTALL)
+if new_content == content:
+    # Try without comment header
+    pattern2 = r'subnet\s+' + re.escape(target) + r'\s+netmask[^{]+\{[^}]*(?:\{[^}]*\}[^}]*)?\}'
+    new_content = re.sub(pattern2, '', content, flags=re.DOTALL)
+
+with open(conf_path, 'w') as f:
+    f.write(new_content)
+PYEOF
+  ok "Subnet ${target} removed (if it existed)."
+  cmd_config_validate_quiet && ok "Config valid." && _reload_prompt
+}
+
+# ── STATIC LEASES ─────────────────────────────────────────────────────────────
+cmd_lease_static_add() {
+  require_root
+  require_dhcpd
+  header "Add Static Lease"
+
+  local hostname mac ip subnet
+
+  prompt hostname "Hostname for this host"
+  while true; do
+    prompt mac "MAC address (xx:xx:xx:xx:xx:xx)"
+    is_valid_mac "$mac" && break; warn "Invalid MAC address format."
+  done
+  while true; do
+    prompt ip "Fixed IP address"
+    is_valid_ip "$ip" && break; warn "Invalid IP address."
+  done
+
+  local extra_opts=""
+  if prompt_yn "Add extra options for this host?" N; then
+    local _opt _val
+    while true; do
+      prompt _opt "  Option name (blank to finish)" ""
+      [[ -z "$_opt" ]] && break
+      prompt _val "  Value"
+      extra_opts+="
+  option ${_opt} ${_val};"
+    done
+  fi
+
+  backup_conf
+  cat >> "$DHCPD_CONF" <<EOF
+
+# Static lease: ${hostname}
+host ${hostname} {
+  hardware ethernet ${mac};
+  fixed-address ${ip};${extra_opts}
+}
+EOF
+  ok "Static lease added for ${hostname} (${mac} → ${ip})."
+  cmd_config_validate_quiet && ok "Config valid." && _reload_prompt
+}
+
+cmd_lease_static_list() {
+  require_dhcpd
+  header "Static Leases"
+  local found=0
+  while IFS= read -r line; do
+    found=1
+    echo -e "  ${GREEN}▸${RESET} ${line}"
+  done < <(grep -A3 '^host ' "$DHCPD_CONF" | grep -E 'hardware ethernet|fixed-address|^host ' | paste - - - | \
+    awk '{gsub(/[;{}]/,""); print $2 "\t" $5 "\t→\t" $7}' 2>/dev/null || true)
+  [[ $found -eq 0 ]] && info "No static leases configured."
+}
+
+cmd_lease_static_remove() {
+  require_root
+  require_dhcpd
+  local mac="${1:-}"
+  if [[ -z "$mac" ]]; then
+    prompt mac "MAC address of lease to remove"
+  fi
+  backup_conf
+  python3 - "$DHCPD_CONF" "$mac" <<'PYEOF'
+import sys, re
+conf_path, mac = sys.argv[1], sys.argv[2].lower()
+with open(conf_path) as f:
+    content = f.read()
+pattern = r'#[^\n]*\n' + r'host\s+\S+\s*\{[^}]*hardware\s+ethernet\s+' + re.escape(mac) + r'[^}]*\}'
+new_content = re.sub(pattern, '', content, flags=re.DOTALL|re.IGNORECASE)
+if new_content == content:
+    pattern2 = r'host\s+\S+\s*\{[^}]*hardware\s+ethernet\s+' + re.escape(mac) + r'[^}]*\}'
+    new_content = re.sub(pattern2, '', content, flags=re.DOTALL|re.IGNORECASE)
+with open(conf_path, 'w') as f:
+    f.write(new_content)
+PYEOF
+  ok "Static lease for ${mac} removed."
+  cmd_config_validate_quiet && ok "Config valid." && _reload_prompt
+}
+
+# ── ACTIVE LEASES ─────────────────────────────────────────────────────────────
+cmd_lease_list() {
+  header "Active Leases"
+  if [[ ! -f "$LEASES_FILE" ]]; then
+    info "Leases file not found: ${LEASES_FILE}"
+    return 0
+  fi
+
+  printf "${BOLD}%-18s %-17s %-20s %-26s %-26s${RESET}\n" \
+    "IP Address" "MAC Address" "Hostname" "Starts" "Ends"
+  divider
+
+  python3 - "$LEASES_FILE" <<'PYEOF'
+import sys, re
+from datetime import datetime
+
+ACTIVE_RE = re.compile(r'lease\s+([\d.]+)\s*\{(.*?)\}', re.DOTALL)
+FIELD_RE = {
+    'mac':   re.compile(r'hardware ethernet\s+([\w:]+);'),
+    'host':  re.compile(r'client-hostname\s+"([^"]+)"'),
+    'start': re.compile(r'starts\s+\d+\s+([\d/ :]+);'),
+    'end':   re.compile(r'ends\s+\d+\s+([\d/ :]+);'),
+    'bind':  re.compile(r'binding state\s+(\w+);'),
+}
+
+with open(sys.argv[1]) as f:
+    content = f.read()
+
+leases = {}
+for m in ACTIVE_RE.finditer(content):
+    ip, body = m.group(1), m.group(2)
+    rec = {'ip': ip}
+    for k, rx in FIELD_RE.items():
+        mo = rx.search(body)
+        rec[k] = mo.group(1) if mo else ''
+    if rec.get('bind','') == 'active':
+        leases[ip] = rec
+
+if not leases:
+    print("  No active leases found.")
+    sys.exit(0)
+
+for ip, r in sorted(leases.items()):
+    print(f"  {r['ip']:<18} {r['mac']:<17} {r.get('host',''):<20} {r['start']:<26} {r['end']:<26}")
+PYEOF
+}
+
+# ── GLOBAL OPTIONS ────────────────────────────────────────────────────────────
+cmd_option_set() {
+  require_root
+  require_dhcpd
+  header "Set Global Option"
+
+  local opt_name opt_value
+  prompt opt_name  "Option name  (e.g. domain-name-servers, routers, ntp-servers)"
+  prompt opt_value "Option value (e.g. 8.8.8.8, 8.8.4.4)"
+
+  backup_conf
+
+  # Replace if exists, otherwise insert after 'authoritative'
+  if grep -q "^option ${opt_name}" "$DHCPD_CONF"; then
+    sed -i "s|^option ${opt_name}.*|option ${opt_name} ${opt_value};|" "$DHCPD_CONF"
+    ok "Updated: option ${opt_name} ${opt_value};"
+  else
+    sed -i "/^# ── Global settings/a option ${opt_name} ${opt_value};" "$DHCPD_CONF"
+    ok "Added: option ${opt_name} ${opt_value};"
+  fi
+  cmd_config_validate_quiet && ok "Config valid." && _reload_prompt
+}
+
+cmd_option_list() {
+  require_dhcpd
+  header "Global Options"
+  grep -E '^(option|default-lease-time|max-lease-time|authoritative|log-facility)' "$DHCPD_CONF" \
+    | while IFS= read -r line; do echo -e "  ${GREEN}▸${RESET} ${line}"; done \
+    || info "No global options found."
+}
+
+# ── INTERFACE ─────────────────────────────────────────────────────────────────
+cmd_interface_set() {
+  require_root
+  local iface="${1:-}"
+  if [[ -z "$iface" ]]; then
+    _iface_select
+    iface="$_SELECTED_IFACE"
+  fi
+  _write_interface_file "$iface"
+  _reload_prompt
+}
+
+cmd_interface_list() {
+  header "Available Network Interfaces"
+  ip -o link show | awk -F': ' '{print $2}' | grep -v '^lo$' | while read -r iface; do
+    local state; state=$(ip link show "$iface" | awk '/state/{print $9}')
+    local ip4; ip4=$(ip -4 addr show "$iface" 2>/dev/null | awk '/inet /{print $2}' | head -1)
+    local current=""
+    if [[ -f "$DHCPD_DEFAULT" ]] && grep -q "\"${iface}\"" "$DHCPD_DEFAULT" 2>/dev/null; then
+      current=" ${CYAN}[current]${RESET}"
+    fi
+    echo -e "  ${GREEN}▸${RESET} ${BOLD}${iface}${RESET}  state=${state}  addr=${ip4:-none}${current}"
+  done
+}
+
+# ── PXE BOOT ──────────────────────────────────────────────────────────────────
+cmd_pxe_configure() {
+  require_root
+  require_dhcpd
+  header "PXE Boot Configuration"
+
+  local tftp_server boot_file next_server
+  while true; do
+    prompt tftp_server "TFTP server IP address"
+    is_valid_ip "$tftp_server" && break; warn "Invalid IP."
+  done
+  prompt boot_file  "Boot filename" "pxelinux.0"
+
+  local target_subnet
+  prompt target_subnet "Apply to subnet (CIDR, or 'global' for global scope)" "global"
+
+  backup_conf
+
+  if [[ "$target_subnet" == "global" ]]; then
+    cat >> "$DHCPD_CONF" <<EOF
+
+# ── PXE Boot (global) ─────────────────────────────────────────────────────────
+next-server ${tftp_server};
+filename "${boot_file}";
+EOF
+  else
+    local net="${target_subnet%/*}"
+    python3 - "$DHCPD_CONF" "$net" "$tftp_server" "$boot_file" <<'PYEOF'
+import sys, re
+conf, net, tftp, bfile = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+with open(conf) as f:
+    content = f.read()
+insert = f'\n  next-server {tftp};\n  filename "{bfile}";'
+pattern = r'(subnet\s+' + re.escape(net) + r'[^{]*\{)'
+new_content = re.sub(pattern, r'\1' + insert, content)
+with open(conf, 'w') as f:
+    f.write(new_content)
+PYEOF
+  fi
+  ok "PXE boot configured."
+  cmd_config_validate_quiet && ok "Config valid." && _reload_prompt
+}
+
+# ── FAILOVER ──────────────────────────────────────────────────────────────────
+cmd_failover_configure() {
+  require_root
+  require_dhcpd
+  header "DHCP Failover Configuration"
+  info "Failover requires two DHCP servers. Configure primary first, then secondary."
+
+  local role
+  prompt_select role "This server's role:" "primary" "secondary"
+
+  local peer_name peer_ip my_ip
+  prompt peer_name "Failover peer name (must match on both servers)" "dhcp-failover"
+  while true; do
+    prompt my_ip "This server's IP address"
+    is_valid_ip "$my_ip" && break; warn "Invalid IP."
+  done
+  while true; do
+    prompt peer_ip "Peer server's IP address"
+    is_valid_ip "$peer_ip" && break; warn "Invalid IP."
+  done
+
+  local port="647"; [[ "$role" == "secondary" ]] && port="647"
+  local mclt="3600" split="128"
+  if [[ "$role" == "primary" ]]; then
+    prompt mclt  "MCLT (max client lead time, seconds)" "3600"
+    prompt split "Split value (0-256, 128=50/50)"       "128"
+  fi
+
+  local failover_block
+  if [[ "$role" == "primary" ]]; then
+    failover_block="failover peer \"${peer_name}\" {
+  primary;
+  address ${my_ip};
+  port ${port};
+  peer address ${peer_ip};
+  peer port ${port};
+  max-response-delay 30;
+  max-unacked-updates 10;
+  mclt ${mclt};
+  split ${split};
+  load balance max seconds 3;
+}"
+  else
+    failover_block="failover peer \"${peer_name}\" {
+  secondary;
+  address ${my_ip};
+  port ${port};
+  peer address ${peer_ip};
+  peer port ${port};
+  max-response-delay 30;
+  max-unacked-updates 10;
+  load balance max seconds 3;
+}"
+  fi
+
+  backup_conf
+  echo "" >> "$DHCPD_CONF"
+  echo "# ── Failover ──────────────────────────────────────────────────────────────────" >> "$DHCPD_CONF"
+  echo "$failover_block" >> "$DHCPD_CONF"
+
+  info "Now add 'failover peer \"${peer_name}\";' inside each pool you want to use failover."
+  ok "Failover block written. Edit pools manually or re-add subnets."
+  cmd_config_validate_quiet || err "Config has errors."
+}
+
+# ── POOL management ───────────────────────────────────────────────────────────
+cmd_pool_add() {
+  require_root
+  require_dhcpd
+  header "Add Address Pool to Subnet"
+
+  local target_net
+  prompt target_net "Subnet network address (e.g. 192.168.20.0)"
+
+  local range_start range_end
+  while true; do
+    prompt range_start "Pool start IP"
+    is_valid_ip "$range_start" && break; warn "Invalid IP."
+  done
+  while true; do
+    prompt range_end "Pool end IP"
+    is_valid_ip "$range_end" && break; warn "Invalid IP."
+  done
+
+  local allow_deny="allow"
+  prompt_yn "Deny unknown clients in this pool?" N && allow_deny="deny"
+
+  local lease_d="" lease_m=""
+  if prompt_yn "Set pool-specific lease times?" N; then
+    prompt lease_d "Default lease (seconds)" "86400"
+    prompt lease_m "Max lease (seconds)"     "172800"
+  fi
+
+  backup_conf
+
+  local pool_block="  pool {\n    ${allow_deny} unknown clients;\n    range ${range_start} ${range_end};"
+  [[ -n "$lease_d" ]] && pool_block+="\n    default-lease-time ${lease_d};\n    max-lease-time ${lease_m};"
+  pool_block+="\n  }"
+
+  python3 - "$DHCPD_CONF" "$target_net" "$pool_block" <<'PYEOF'
+import sys, re
+conf, net, pool = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(conf) as f:
+    content = f.read()
+pattern = r'(subnet\s+' + re.escape(net) + r'[^{]*\{)'
+new_content = re.sub(pattern, r'\1\n' + pool, content)
+with open(conf, 'w') as f:
+    f.write(new_content)
+PYEOF
+  ok "Pool added to subnet ${target_net}."
+  cmd_config_validate_quiet && ok "Config valid." && _reload_prompt
+}
+
+cmd_pool_list() {
+  require_dhcpd
+  header "Address Pools"
+  python3 - "$DHCPD_CONF" <<'PYEOF'
+import sys, re
+with open(sys.argv[1]) as f:
+    content = f.read()
+
+subnet_re = re.compile(r'subnet\s+([\d.]+)\s+netmask\s+([\d.]+)\s*\{(.*?)\n\}', re.DOTALL)
+pool_re   = re.compile(r'pool\s*\{(.*?)\}', re.DOTALL)
+range_re  = re.compile(r'range\s+([\d.]+)\s+([\d.]+)')
+
+for sm in subnet_re.finditer(content):
+    net, mask, body = sm.group(1), sm.group(2), sm.group(3)
+    for pm in pool_re.finditer(body):
+        rm = range_re.search(pm.group(1))
+        if rm:
+            print(f"  Subnet {net}/{mask}: {rm.group(1)} — {rm.group(2)}")
+PYEOF
+}
+
+# ── SERVICE ───────────────────────────────────────────────────────────────────
+cmd_service() {
+  require_root
+  local action="${1:-status}"
+  case "$action" in
+    start|stop|restart|reload|status|enable|disable)
+      systemctl "$action" isc-dhcp-server
+      ;;
+    *)
+      die "Unknown service action: ${action}. Use: start|stop|restart|reload|status|enable|disable"
+      ;;
+  esac
+}
+
+# ── CONFIG commands ───────────────────────────────────────────────────────────
+cmd_config_show() {
+  require_dhcpd
+  header "Current dhcpd.conf"
+  cat "$DHCPD_CONF"
+}
+
+cmd_config_edit() {
+  require_root
+  require_dhcpd
+  backup_conf
+  "${EDITOR:-nano}" "$DHCPD_CONF"
+  cmd_config_validate_quiet && ok "Config valid." && _reload_prompt
+}
+
+cmd_config_validate() {
+  require_dhcpd
+  header "Validating Configuration"
+  dhcpd -t -cf "$DHCPD_CONF" 2>&1 && ok "Configuration is valid." || err "Validation failed."
+}
+
+cmd_config_validate_quiet() {
+  dhcpd -t -cf "$DHCPD_CONF" &>/dev/null
+}
+
+cmd_config_backup() {
+  require_root
+  require_dhcpd
+  backup_conf
+  ok "Backup complete → ${BACKUP_DIR}/"
+  ls -lt "$BACKUP_DIR" | head -6
+}
+
+cmd_config_restore() {
+  require_root
+  require_dhcpd
+  header "Restore Configuration from Backup"
+  if [[ ! -d "$BACKUP_DIR" ]] || [[ -z "$(ls -A "$BACKUP_DIR" 2>/dev/null)" ]]; then
+    die "No backups found in ${BACKUP_DIR}/"
+  fi
+  local -a backups=()
+  while IFS= read -r f; do
+    backups+=("$(basename "$f")")
+  done < <(ls -1t "${BACKUP_DIR}"/dhcpd.conf.* 2>/dev/null)
+  prompt_select _backup_choice "Select backup to restore:" "${backups[@]}"
+  cp "${BACKUP_DIR}/${_backup_choice}" "$DHCPD_CONF"
+  ok "Restored from ${_backup_choice}."
+  cmd_config_validate_quiet && ok "Config valid." && _reload_prompt
+}
+
+# ── LOGS ──────────────────────────────────────────────────────────────────────
+cmd_log_show() {
+  header "DHCP Server Logs"
+  if command -v journalctl &>/dev/null; then
+    journalctl -u isc-dhcp-server -n 100 --no-pager -e 2>/dev/null \
+      || journalctl -t dhcpd -n 100 --no-pager 2>/dev/null \
+      || info "No journal entries found."
+  else
+    grep -i dhcp /var/log/syslog 2>/dev/null | tail -100 \
+      || info "No syslog entries found."
+  fi
+}
+
+# ── UNINSTALL ─────────────────────────────────────────────────────────────────
+cmd_uninstall() {
+  require_root
+  header "Uninstall ISC DHCP Server"
+  warn "This will remove isc-dhcp-server and its configuration."
+  prompt_yn "Are you SURE you want to uninstall?" N || { info "Aborted."; return 0; }
+  backup_conf
+  ok "Config backed up to ${BACKUP_DIR}/"
+  systemctl stop isc-dhcp-server 2>/dev/null || true
+  apt-get remove --purge -y isc-dhcp-server
+  ok "isc-dhcp-server has been removed."
+}
+
+# ── Reload helper ─────────────────────────────────────────────────────────────
+_reload_prompt() {
+  if systemctl is-active --quiet isc-dhcp-server 2>/dev/null; then
+    if prompt_yn "Reload DHCP server to apply changes?" Y; then
+      systemctl reload-or-restart isc-dhcp-server
+      ok "DHCP server reloaded."
+    fi
+  fi
+}
+
+# ── HELP ──────────────────────────────────────────────────────────────────────
+cmd_help() {
+  cat <<HELP
+${BOLD}${CYAN}dhcp-manager${RESET} v${VERSION} — ISC DHCP Server Management Utility
+
+${BOLD}USAGE${RESET}
+  dhcp-manager [command] [subcommand] [options]
+
+  Run without arguments to enter the interactive wizard.
+
+${BOLD}COMMANDS${RESET}
+  ${CYAN}install${RESET}                        Install isc-dhcp-server
+  ${CYAN}configure${RESET}                      Interactive full configuration wizard
+  ${CYAN}uninstall${RESET}                      Remove isc-dhcp-server
+
+  ${CYAN}subnet add${RESET}                     Add a subnet interactively
+  ${CYAN}subnet list${RESET}                    List configured subnets
+  ${CYAN}subnet remove${RESET} <network>        Remove a subnet by network address
+
+  ${CYAN}lease list${RESET}                     Show active leases from leases file
+  ${CYAN}lease static add${RESET}               Add a static (fixed) lease
+  ${CYAN}lease static list${RESET}              List static leases
+  ${CYAN}lease static remove${RESET} <mac>      Remove a static lease by MAC
+
+  ${CYAN}option set${RESET}                     Set or update a global DHCP option
+  ${CYAN}option list${RESET}                    List all global DHCP options
+
+  ${CYAN}interface set${RESET} [iface]          Set listening interface
+  ${CYAN}interface list${RESET}                 List network interfaces
+
+  ${CYAN}pxe configure${RESET}                  Configure PXE/TFTP boot options
+  ${CYAN}failover configure${RESET}             Configure failover peer
+  ${CYAN}pool add${RESET}                       Add an address pool to a subnet
+  ${CYAN}pool list${RESET}                      List all address pools
+
+  ${CYAN}service${RESET} <action>               Manage DHCP service
+    Actions: start | stop | restart | reload | status | enable | disable
+
+  ${CYAN}config show${RESET}                    Print current dhcpd.conf
+  ${CYAN}config edit${RESET}                    Open dhcpd.conf in \$EDITOR
+  ${CYAN}config validate${RESET}                Validate dhcpd.conf syntax
+  ${CYAN}config backup${RESET}                  Create timestamped backup
+  ${CYAN}config restore${RESET}                 Restore from a previous backup
+
+  ${CYAN}log show${RESET}                       Show recent DHCP server logs
+
+  ${CYAN}--help, -h${RESET}                     Show this help
+  ${CYAN}--version, -v${RESET}                  Show version
+
+${BOLD}EXAMPLES${RESET}
+  sudo dhcp-manager                      # Interactive wizard
+  sudo dhcp-manager install              # Install + wizard
+  sudo dhcp-manager configure            # Re-run wizard
+  sudo dhcp-manager subnet add           # Add subnet interactively
+  sudo dhcp-manager lease list           # Show active leases
+  sudo dhcp-manager service restart      # Restart DHCP service
+  sudo dhcp-manager config validate      # Check config syntax
+  sudo dhcp-manager log show             # Tail DHCP logs
+
+${BOLD}FILES${RESET}
+  Config:   ${DHCPD_CONF}
+  Default:  ${DHCPD_DEFAULT}
+  Leases:   ${LEASES_FILE}
+  Backups:  ${BACKUP_DIR}/
+
+${BOLD}NOTES${RESET}
+  • All write operations require root (sudo).
+  • Backups are created automatically before any config change.
+  • Set \$EDITOR to choose your preferred editor (default: nano).
+HELP
+}
+
+# ── INTERACTIVE MAIN MENU ─────────────────────────────────────────────────────
+cmd_interactive() {
+  while true; do
+    header "dhcp-manager v${VERSION}"
+    echo -e "  ${CYAN}1${RESET})  Install DHCP server"
+    echo -e "  ${CYAN}2${RESET})  Full configuration wizard"
+    echo -e "  ${CYAN}3${RESET})  Manage subnets"
+    echo -e "  ${CYAN}4${RESET})  Manage leases"
+    echo -e "  ${CYAN}5${RESET})  Global options"
+    echo -e "  ${CYAN}6${RESET})  Network interface"
+    echo -e "  ${CYAN}7${RESET})  Service control"
+    echo -e "  ${CYAN}8${RESET})  Configuration file"
+    echo -e "  ${CYAN}9${RESET})  PXE boot setup"
+    echo -e "  ${CYAN}10${RESET}) Failover setup"
+    echo -e "  ${CYAN}11${RESET}) Address pools"
+    echo -e "  ${CYAN}12${RESET}) View logs"
+    echo -e "  ${CYAN}13${RESET}) Uninstall"
+    echo -e "  ${CYAN}0${RESET})  Exit"
+    divider
+    echo -ne "${BOLD}Choice${RESET}: "
+    read -r _choice
+    case "$_choice" in
+      1)  cmd_install ;;
+      2)  cmd_configure ;;
+      3)  _menu_subnet ;;
+      4)  _menu_lease ;;
+      5)  _menu_option ;;
+      6)  _menu_interface ;;
+      7)  _menu_service ;;
+      8)  _menu_config ;;
+      9)  cmd_pxe_configure ;;
+      10) cmd_failover_configure ;;
+      11) _menu_pool ;;
+      12) cmd_log_show ;;
+      13) cmd_uninstall ;;
+      0)  echo "Bye!"; exit 0 ;;
+      *)  warn "Invalid choice." ;;
+    esac
+  done
+}
+
+_menu_subnet() {
+  prompt_select _s "Subnet Management:" "Add subnet" "List subnets" "Remove subnet" "Back"
+  case "$_s" in
+    "Add subnet")    cmd_subnet_add ;;
+    "List subnets")  cmd_subnet_list ;;
+    "Remove subnet") cmd_subnet_remove ;;
+  esac
+}
+
+_menu_lease() {
+  prompt_select _s "Lease Management:" "List active leases" "Add static lease" "List static leases" "Remove static lease" "Back"
+  case "$_s" in
+    "List active leases")  cmd_lease_list ;;
+    "Add static lease")    cmd_lease_static_add ;;
+    "List static leases")  cmd_lease_static_list ;;
+    "Remove static lease") cmd_lease_static_remove ;;
+  esac
+}
+
+_menu_option() {
+  prompt_select _s "Global Options:" "Set option" "List options" "Back"
+  case "$_s" in
+    "Set option")  cmd_option_set ;;
+    "List options") cmd_option_list ;;
+  esac
+}
+
+_menu_interface() {
+  prompt_select _s "Interface:" "Set interface" "List interfaces" "Back"
+  case "$_s" in
+    "Set interface")  cmd_interface_set ;;
+    "List interfaces") cmd_interface_list ;;
+  esac
+}
+
+_menu_service() {
+  prompt_select _s "Service:" "Status" "Start" "Stop" "Restart" "Reload" "Enable" "Disable" "Back"
+  [[ "$_s" == "Back" ]] && return
+  cmd_service "${_s,,}"
+}
+
+_menu_config() {
+  prompt_select _s "Configuration:" "Show config" "Edit config" "Validate config" "Backup config" "Restore config" "Back"
+  case "$_s" in
+    "Show config")    cmd_config_show ;;
+    "Edit config")    cmd_config_edit ;;
+    "Validate config") cmd_config_validate ;;
+    "Backup config")  cmd_config_backup ;;
+    "Restore config") cmd_config_restore ;;
+  esac
+}
+
+_menu_pool() {
+  prompt_select _s "Address Pools:" "Add pool" "List pools" "Back"
+  case "$_s" in
+    "Add pool")   cmd_pool_add ;;
+    "List pools") cmd_pool_list ;;
+  esac
+}
+
+# ── ENTRY POINT ───────────────────────────────────────────────────────────────
+main() {
+  local cmd="${1:-}"
+
+  case "$cmd" in
+    install)    cmd_install ;;
+    configure)  cmd_configure ;;
+    uninstall)  cmd_uninstall ;;
+
+    subnet)
+      local sub="${2:-list}"
+      case "$sub" in
+        add)    cmd_subnet_add ;;
+        list)   cmd_subnet_list ;;
+        remove) cmd_subnet_remove "${3:-}" ;;
+        *)      die "Unknown subnet subcommand: ${sub}" ;;
+      esac ;;
+
+    lease)
+      local sub="${2:-list}"
+      case "$sub" in
+        list)   cmd_lease_list ;;
+        static)
+          local ssub="${3:-list}"
+          case "$ssub" in
+            add)    cmd_lease_static_add ;;
+            list)   cmd_lease_static_list ;;
+            remove) cmd_lease_static_remove "${4:-}" ;;
+            *)      die "Unknown lease static subcommand: ${ssub}" ;;
+          esac ;;
+        *)      die "Unknown lease subcommand: ${sub}" ;;
+      esac ;;
+
+    option)
+      local sub="${2:-list}"
+      case "$sub" in
+        set)  cmd_option_set ;;
+        list) cmd_option_list ;;
+        *)    die "Unknown option subcommand: ${sub}" ;;
+      esac ;;
+
+    interface)
+      local sub="${2:-list}"
+      case "$sub" in
+        set)  cmd_interface_set "${3:-}" ;;
+        list) cmd_interface_list ;;
+        *)    die "Unknown interface subcommand: ${sub}" ;;
+      esac ;;
+
+    service)  cmd_service "${2:-status}" ;;
+
+    config)
+      local sub="${2:-show}"
+      case "$sub" in
+        show)     cmd_config_show ;;
+        edit)     cmd_config_edit ;;
+        validate) cmd_config_validate ;;
+        backup)   cmd_config_backup ;;
+        restore)  cmd_config_restore ;;
+        *)        die "Unknown config subcommand: ${sub}" ;;
+      esac ;;
+
+    pxe)
+      local sub="${2:-configure}"
+      [[ "$sub" == "configure" ]] && cmd_pxe_configure || die "Unknown pxe subcommand: ${sub}" ;;
+
+    failover)
+      local sub="${2:-configure}"
+      [[ "$sub" == "configure" ]] && cmd_failover_configure || die "Unknown failover subcommand: ${sub}" ;;
+
+    pool)
+      local sub="${2:-list}"
+      case "$sub" in
+        add)  cmd_pool_add ;;
+        list) cmd_pool_list ;;
+        *)    die "Unknown pool subcommand: ${sub}" ;;
+      esac ;;
+
+    log)
+      local sub="${2:-show}"
+      [[ "$sub" == "show" ]] && cmd_log_show || die "Unknown log subcommand: ${sub}" ;;
+
+    --help|-h|help) cmd_help ;;
+    --version|-v|version) echo "dhcp-manager v${VERSION}" ;;
+
+    "")  cmd_interactive ;;
+
+    *) err "Unknown command: ${cmd}"; echo ""; cmd_help; exit 1 ;;
+  esac
+}
+
+main "$@"
